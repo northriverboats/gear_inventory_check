@@ -40,10 +40,14 @@ import os
 import click
 import json
 import requests
+import sqlite3
+from contextlib import contextmanager
 from requests.auth import HTTPBasicAuth
+from datetime import date
 from dotenv import load_dotenv
 from envelopes import Envelope
 from smtplib import SMTPException # allow for silent fail in try exception
+from pprint import pprint
 
 def resource_path(relative_path):
     """ Get absolute path to resource, works for dev and for PyInstaller """
@@ -100,8 +104,6 @@ def email_status(low, status):  # pylint: disable=unused-argument
     """
     mail_results(subject, body)
 
-
-
 def format_list(cartridges):
     """format cartridge list"""
 
@@ -115,18 +117,95 @@ def format_list(cartridges):
         text += line
     return text
 
+@contextmanager
+def db_ops(db_name):
+    """create context manager for sqlite3 cursor"""
+    connection = sqlite3.connect(db_name,isolation_level=None)
+    cursor = connection.cursor()
+    yield cursor
+    connection.commit()
+    connection.close()
+
+def create_database(cursor):
+    """create database tables if needed"""
+    schema = """ 
+        CREATE TABLE IF NOT EXISTS INVENTORY (
+            DATE     CHAR(19)        NOT NULL, 
+            ID       INT             NOT NULL,
+            NAME     VARCHAR(255)    NOT NULL, 
+            QUANTITY REAL            NOT NULL);
+    """
+    cursor.execute(schema)
+
+
+
+def handle_variation(variations):
+    """process a list of variation ids"""
+    products = []
+    for variation in variations:
+        response = requests.get(os.getenv('API_BASE') + 'products/' + str(variation), auth = HTTPBasicAuth(os.getenv('API_USER'), os.getenv('API_PASS')))
+        item = json.loads( json.dumps(response.json()) )
+        if item['variations']:
+            products = products + handle_variations(item['variations'])
+        else:
+            products.append({"id": item["id"], "name": item["name"], "quantity": item["stock_quantity"]})
+    return products
+
+
+def handle_variations(variations):
+    """process the top level variation list of dictionaries"""
+    products = []
+    for variation in variations:
+        products = products + handle_variation(variation["variations"])
+    return products
+
+def get_current_stock_values():
+    """x"""
+    response = requests.get(os.getenv('API_BASE') + 'products/', auth = HTTPBasicAuth(os.getenv('API_USER'), os.getenv('API_PASS')))
+
+    all = json.loads( json.dumps(response.json()) )
+    simple = [x for x in all if x['type'] == 'simple']
+    variations = [x for x in all if x['type'] == 'variable']
+
+    products = [{"id": x['id'], "name": x['name'], "quantity": x['stock_quantity']} for x in all  if x['type'] == 'simple']
+    products = products + handle_variations(variations)
+    return products
+
+def format_products(products):
+    """create formated list"""
+    output = ""
+    for product in products:
+        output += f"{product['quantity']:7.2f}   {product['name']}\n"
+    return output
 
 # pylint: disable=no-value-for-parameter
 @click.command()
 @click.option('--debug', '-d', is_flag=True,
     help='show debug output do not email')
+@click.option('--print', '-p', 'print_arg', is_flag=True,
+    help='print ouptup')
 @click.option('--status', '-s', is_flag=True,
     help='just print/show status')
-def main(debug, status):
-    """check ink levels and email results"""
+def main(debug, print_arg, status):
+    """Check Gear Store Inventory Levels"""
 
     # load environmental variables
     load_dotenv(dotenv_path=resource_path(".env"))
+
+
+    # always pull current inventory
+    products = get_current_stock_values()
+
+    # database stuff
+    with db_ops(os.getenv("DB_FILE")) as cursor:
+        create_database(cursor)
+        cursor.execute("""DELETE FROM inventory WHERE date(date) = ?""", (date.today().strftime("%Y-%m-%d"),))
+        cursor.execute("VACUUM")
+        cursor.executemany("""INSERT INTO inventory(date, id, name, quantity) VALUES(datetime('now', 'localtime'), :id, :name, :quantity)""", products)
+
+    if print_arg:
+        print(format_products(products))
+
     if debug:
         print("Cartridge Status")
         return
