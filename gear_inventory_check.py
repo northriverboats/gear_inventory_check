@@ -121,6 +121,7 @@ def format_list(cartridges):
 def db_ops(db_name):
     """create context manager for sqlite3 cursor"""
     connection = sqlite3.connect(db_name,isolation_level=None)
+    connection.row_factory = sqlite3.Row
     cursor = connection.cursor()
     yield cursor
     connection.commit()
@@ -186,12 +187,27 @@ def format_products(products):
     help='print ouptup')
 @click.option('--status', '-s', is_flag=True,
     help='just print/show status')
-def main(debug, print_arg, status):
+@click.option('--date1', type=click.DateTime(formats=["%Y-%m-%d"]), default=str(date.today()))
+def main(debug, print_arg, status, date1):
     """Check Gear Store Inventory Levels"""
+    today = date1.strftime("%Y-%m-%d")
 
     # load environmental variables
     load_dotenv(dotenv_path=resource_path(".env"))
 
+    sql1 = """
+        SELECT t.id as id, t.name as name, t.quantity as quantity, y.quantity as change
+        FROM inventory t
+        JOIN inventory y ON t.id = y.id AND date(y.date) = '2024-01-02'
+        WHERE date(t.date) = '2024-01-03'
+        ORDER BY t.name;"""
+
+    sql = """
+        SELECT t.id as id, t.name as Item, t.quantity as Quantity, y.quantity - t.quantity as change
+          FROM inventory t
+          JOIN (SELECT id, quantity FROM inventory WHERE date = '2024-01-02') y on t.id = y.id
+         WHERE date(t.date) = '2024-01-03'
+      ORDER BY t.name;"""
 
     # always pull current inventory
     products = get_current_stock_values()
@@ -199,17 +215,40 @@ def main(debug, print_arg, status):
     # database stuff
     with db_ops(os.getenv("DB_FILE")) as cursor:
         create_database(cursor)
-        cursor.execute("""DELETE FROM inventory WHERE date(date) = ?""", (date.today().strftime("%Y-%m-%d"),))
+        cursor.execute("""DELETE FROM inventory WHERE date(date) = ?;""", (date.today().strftime("%Y-%m-%d"),))
         cursor.execute("VACUUM")
-        cursor.executemany("""INSERT INTO inventory(date, id, name, quantity) VALUES(datetime('now', 'localtime'), :id, :name, :quantity)""", products)
+        cursor.executemany("""INSERT INTO inventory(date, id, name, quantity) VALUES(datetime('now', 'localtime'), :id, :name, :quantity);""", products)
+        # find prior day
+        before = cursor.execute("""SELECT DISTINCT date(date) AS date from inventory WHERE date(date) < date(?) ORDER BY date DESC LIMIT 1;""", (today,)).fetchone()
+        yesterday = before['date']
+        # get rows for requested date
+        rows1 = cursor.execute("""SELECT date, id, name, quantity FROM inventory WHERE date(date) = ? ORDER BY name""", (today ,)).fetchall()
+        # get day before requested date
+        rows2 = cursor.execute("""SELECT date, id, name, quantity FROM inventory WHERE date(date) = ? ORDER BY name""", (yesterday ,)).fetchall()
+        # the full monty
+        rows3 = cursor.execute(sql).fetchall()
+
+    # output todays inventory to new.txt
+    with open('/tmp/new.txt', 'w') as f:
+        print("QTY       ITEM                                                                    ", file=f)
+        print("-------   ------------------------------------------------------------------------", file=f)
+        for row in rows1:
+            print(f"{row['quantity']:7.2f}   {row['name']}", file=f)
+
+    # output yesterdays inventory to old.txt
+    with open('/tmp/old.txt', 'w') as f:
+        print("QTY       ITEM                                                                    ", file=f)
+        print("-------   ------------------------------------------------------------------------", file=f)
+        for row in rows2:
+            print(f"{row['quantity']:7.2f}   {row['name']}", file=f)
 
     if print_arg:
-        print(format_products(products))
-
-    if debug:
-        print("Cartridge Status")
-        return
-
+        # save as new
+        for row in rows3:
+            if row['change'] == 77:
+                print(f"        {row['quantity']:7.2f}  {row['name']}")
+            else:
+                print(f"{row['change']:7.2f} {row['quantity']:7.2f}  {row['name']}")
 
 if __name__ == "__main__":
     main()
